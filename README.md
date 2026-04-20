@@ -1,7 +1,7 @@
 # Algorithmic Trading Pipeline for S\&P 500 Returns Forecasting
 
 [![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
-[![CI](https://github.com/mateuszgrzyb-pl/algorithmic-trading/actions/workflows/ci.yml/badge.svg)](https://github.com/mateuszgrzyb-pl/algorithmic-trading/actions)
+[![CI](https://github.com/mateuszgrzyb-pl/algorithmic_trading/actions/workflows/ci.yml/badge.svg)](https://github.com/mateuszgrzyb-pl/algorithmic_trading/actions)
 [![PEP8](https://img.shields.io/badge/code%20style-PEP8-orange)](https://peps.python.org/pep-0008/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
