@@ -3,11 +3,12 @@ Tools used in data preparation.
 """
 import logging
 from pathlib import Path
-from typing import List, Set, Any, Dict, Union
+from typing import List, Set, Any, Dict, Union, Optional
 
 import numpy as np
 import pandas as pd
 from pyxirr import xirr
+import yfinance as yf
 
 
 logging.basicConfig(
@@ -69,11 +70,6 @@ def get_available_tickers(
     # if filenames like "AAPL.feather" -> stem is "AAPL"
     tickers = sorted({t for t in tickers})
     return tickers
-
-
-def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    """Divides two Series, returning np.nan where the denominator is zero."""
-    return numerator / denominator.replace(0, np.nan)
 
 
 def _validate_and_prepare_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -577,3 +573,326 @@ def validate_dataframe(df: pd.DataFrame) -> bool:
         return False
 
     return True
+
+
+def top_k_score(df: pd.DataFrame, target: str, k: int = 5) -> float:
+    """Calculate the mean target value for top-k predictions grouped by date.
+
+    For each date group, selects the k rows with the highest predicted values
+    and computes the mean of their true target values. The final score is the
+    average across all date groups.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'date', 'pred', and target columns.
+        target (str): Name of the target column.
+        k (int): Number of top predictions to select per date group. Defaults to 5.
+
+    Returns:
+        float: Mean of per-date average true target values for top-k predictions.
+    """
+    scores = []
+    for q, g in df.groupby('date'):
+        top_pred_idx = g['pred'].nlargest(k).index
+        top_true_sum = g.loc[top_pred_idx, target].mean()
+        scores.append(top_true_sum)
+    return np.mean(scores)
+
+
+def random_k_score(df: pd.DataFrame, target: str, k: int = 5, random_state: int = 2001) -> float:
+    """Calculate the mean target value for k randomly selected rows grouped by date.
+
+    For each date group, samples k rows at random and computes the mean of their
+    true target values. Serves as a random baseline to compare against top_k_score.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'date', 'pred', and target columns.
+        target (str): Name of the target column.
+        k (int): Number of rows to sample per date group. Defaults to 5.
+        random_state (int): Random seed for reproducibility. Defaults to 2001.
+
+    Returns:
+        float: Mean of per-date average true target values for randomly selected rows.
+    """
+    scores = []
+    for q, g in df.groupby('date'):
+        top_pred_idx = g.sample(k, random_state=random_state).index
+        top_true_sum = g.loc[top_pred_idx, target].mean()
+        scores.append(top_true_sum)
+    return np.mean(scores)
+
+
+def safe_divide(numerator: float, denominator: float) -> float:
+    """Divide two values, returning np.nan where division is undefined.
+
+    Handles edge cases such as zero denominator or NaN inputs without raising
+    exceptions. Intended for element-wise use on scalar values extracted from
+    a Series or DataFrame.
+
+    Args:
+        numerator (float): The dividend.
+        denominator (float): The divisor.
+
+    Returns:
+        float: Result of numerator / denominator, or np.nan if the denominator
+            is zero, either argument is NaN, or an unexpected error occurs.
+    """
+    try:
+        if denominator == 0 or pd.isna(denominator) or pd.isna(numerator):
+            return np.nan
+        return numerator / denominator
+    except:
+        return np.nan
+
+
+def get_quarter_price(ticker: str, quarter: str) -> Optional[float]:
+    """Retrieve the closing price at the end of a given quarter.
+
+    Fetches the last available closing price within a 7-day window ending on
+    the final day of the specified quarter. Returns np.nan if no data is found
+    or an error occurs during retrieval.
+
+    Args:
+        ticker (str): Stock ticker symbol (e.g. 'AAPL').
+        quarter (str): Quarter string in pandas Period format (e.g. '2023Q4').
+
+    Returns:
+        Optional[float]: Closing price at quarter-end, or np.nan if unavailable.
+    """
+    try:
+        end_dt = pd.Period(quarter).end_time
+        start_dt = end_dt - pd.Timedelta(days=7)
+        
+        hist = yf.Ticker(ticker).history(
+            start=start_dt, 
+            end=end_dt, 
+            auto_adjust=False
+        )
+        
+        if hist.empty or "Close" not in hist.columns:
+            return np.nan
+            
+        return hist["Close"].iloc[-1]
+    except Exception as e:
+        print(f"  ⚠️  Errot. Could not download price data for ticker: {ticker}: {e}")
+        return np.nan
+
+
+def get_financial_value(df: pd.DataFrame, field: str, date: str, ticker: str = "") -> float:
+    """Safely retrieve a single value from a financial DataFrame.
+
+    Looks up the given field (row) and date (column) in a financial statement
+    DataFrame. If the exact date is not found, falls back to the first available
+    column. Returns np.nan for any missing, null, or otherwise unresolvable value.
+
+    Args:
+        df (pd.DataFrame): Financial statement DataFrame with fields as the index
+            and period dates as columns (e.g. from FinanceToolkit).
+        field (str): Row label to retrieve (e.g. 'Total Revenue').
+        date (str): Column label representing the reporting period (e.g. '2023-12-31').
+        ticker (str): Stock ticker symbol, used for logging purposes. Defaults to ''.
+
+    Returns:
+        float: The retrieved value cast to float, or np.nan if the value is
+            missing, null, or an exception occurs.
+    """
+    try:
+        if df is None or df.empty:
+            return np.nan
+        
+        if field not in df.index:
+            return np.nan
+            
+        if date not in df.columns:
+            # Try to find the closest available date
+            available_dates = df.columns.tolist()
+            if not available_dates:
+                return np.nan
+            # Fall back to the first available date
+            date = available_dates[0]
+            
+        value = df.loc[field, date]
+        return float(value) if not pd.isna(value) else np.nan
+        
+    except Exception as e:
+        return np.nan
+
+
+def create_features_per_ticker(ticker: str, date: str, verbose: bool = True) -> pd.DataFrame:
+    """Compute fundamental financial features for a given ticker and quarter.
+
+    Retrieves the quarter-end closing price and financial statement data via
+    yfinance, then derives a set of valuation metrics. If the price is unavailable
+    or a critical error occurs, returns a single-row DataFrame filled with np.nan.
+
+    Args:
+        ticker (str): Stock ticker symbol (e.g. 'AAPL').
+        date (str): Reporting quarter in pandas Period format (e.g. '2024Q1').
+        verbose (bool): Whether to print warnings on non-critical failures.
+            Defaults to True.
+
+    Returns:
+        pd.DataFrame: Single-row DataFrame with the following columns:
+            - ticker: Stock ticker symbol.
+            - date: Reporting quarter.
+            - adj_price: Quarter-end closing price.
+            - graham_number_vs_price: Graham Number divided by price.
+            - eps: Basic earnings per share.
+            - price_to_sales: Price divided by revenue per share.
+            - book_value_per_share: Stockholders equity divided by shares outstanding.
+            - price_to_earnings: Price divided by EPS.
+            - market_cap: Price multiplied by shares outstanding.
+            - price_to_book: Price divided by book value per share.
+            All numeric columns are set to np.nan if data is unavailable.
+    """
+    # Default result returned on unrecoverable failure
+    default_result = pd.DataFrame({
+        'ticker': [ticker],
+        'date': [date],
+        'adj_price': [np.nan],
+        'graham_number_vs_price': [np.nan],
+        'eps': [np.nan],
+        'price_to_sales': [np.nan],
+        'book_value_per_share': [np.nan],
+        'price_to_earnings': [np.nan],
+        'market_cap': [np.nan],
+        'price_to_book': [np.nan]
+    })
+    
+    try:
+        # Fetch quarter-end closing price
+        adj_price = get_quarter_price(ticker, date)
+        if pd.isna(adj_price):
+            if verbose:
+                print(f"  ⚠️  No closing price for {ticker} w {date}")
+            return default_result
+        
+        # Derive the last calendar date of the previous quarter
+        try:
+            date_long = str((pd.Period(date) - 1).end_time.date())
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠️  Error during parsing data for {ticker}: {e}")
+            return default_result
+        
+        # Fetch quarterly financial statements
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            balance_sheet = ticker_obj.quarterly_balance_sheet
+            financials = ticker_obj.quarterly_financials
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠️  Error during downloading data for {ticker}: {e}")
+            return default_result
+        
+        # Extract line items from financial statements
+        total_shareholder_equity = get_financial_value(
+            balance_sheet, "Stockholders Equity", date_long, ticker
+        )
+        weighted_average_shares = get_financial_value(
+            financials, "Basic Average Shares", date_long, ticker
+        )
+        revenue = get_financial_value(
+            financials, "Total Revenue", date_long, ticker
+        )
+        eps = get_financial_value(
+            financials, "Basic EPS", date_long, ticker
+        )
+        
+        # Derive per-share metrics
+        book_value_per_share = safe_divide(
+            total_shareholder_equity, weighted_average_shares
+        )
+        revenue_per_share = safe_divide(revenue, weighted_average_shares)
+        
+        # Graham Number: sqrt(22.5 * EPS * BVPS); undefined for non-positive products
+        try:
+            eps_bvps_product = eps * book_value_per_share
+            if pd.isna(eps_bvps_product) or eps_bvps_product <= 0:
+                graham_number = np.nan
+            else:
+                graham_number = np.sqrt(22.5 * eps_bvps_product)
+        except:
+            graham_number = np.nan
+        
+        # Compute valuation ratios
+        graham_number_vs_price = safe_divide(graham_number, adj_price)
+        price_to_sales = safe_divide(adj_price, revenue_per_share)
+        price_to_earnings = safe_divide(adj_price, eps)
+        
+        try:
+            market_cap = adj_price * weighted_average_shares
+            if pd.isna(market_cap):
+                market_cap = np.nan
+        except:
+            market_cap = np.nan
+            
+        price_to_book = safe_divide(adj_price, book_value_per_share)
+        
+        return pd.DataFrame({
+            'ticker': [ticker],
+            'date': [date],
+            'adj_price': [adj_price],
+            'graham_number_vs_price': [graham_number_vs_price],
+            'eps': [eps],
+            'price_to_sales': [price_to_sales],
+            'book_value_per_share': [book_value_per_share],
+            'price_to_earnings': [price_to_earnings],
+            'market_cap': [market_cap],
+            'price_to_book': [price_to_book]
+        })
+        
+    except Exception as e:
+        if verbose:
+            print(f"  ❌ Unexpected error for {ticker} on {date}: {e}")
+        return default_result
+
+
+def process_multiple_tickers(tickers: list, date: str, verbose: bool = True) -> pd.DataFrame:
+    """Process a list of tickers and concatenate their feature DataFrames.
+
+    Iterates over the provided tickers, calls create_features_per_ticker for
+    each, and collects the results. If a ticker raises an unexpected exception,
+    a fallback row filled with np.nan is appended so that no ticker is silently
+    dropped from the output.
+
+    Args:
+        tickers (list): List of stock ticker symbols (e.g. ['AAPL', 'MSFT']).
+        date (str): Reporting quarter in pandas Period format (e.g. '2024Q1').
+        verbose (bool): Whether to print progress and error messages.
+            Defaults to True.
+
+    Returns:
+        pd.DataFrame: Concatenated DataFrame of all per-ticker feature rows,
+            with a reset index. Returns an empty DataFrame if the input list
+            is empty or all calls fail before appending any results.
+    """
+    results = []
+    
+    for i, ticker in enumerate(tickers, 1):
+        if verbose:
+            print(f"[{i}/{len(tickers)}] Processing {ticker}...")
+        
+        try:
+            df = create_features_per_ticker(ticker, date, verbose=verbose)
+            results.append(df)
+        except Exception as e:
+            # Append a blank row so the ticker is still represented in the output
+            if verbose:
+                print(f"  ❌ Critical error for {ticker}: {e}")
+            results.append(pd.DataFrame({
+                'ticker': [ticker],
+                'date': [date],
+                'adj_price': [np.nan],
+                'graham_number_vs_price': [np.nan],
+                'eps': [np.nan],
+                'price_to_sales': [np.nan],
+                'book_value_per_share': [np.nan],
+                'price_to_earnings': [np.nan],
+                'market_cap': [np.nan],
+                'price_to_book': [np.nan]
+            }))
+    
+    if not results:
+        return pd.DataFrame()
+    
+    return pd.concat(results, ignore_index=True)
