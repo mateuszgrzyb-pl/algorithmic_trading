@@ -37,10 +37,10 @@ dist/
 *.egg-info/
 
 # --- ML / data ---
-data/
-datasets/
-*.csv
-*.parquet
+data/abt/
+data/abt_clean/
+data/scoring/
+*.feather
 *.h5
 *.pkl
 *.joblib
