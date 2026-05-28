@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from app.utils.tools import (
+from src.utils.tools import (
     calculate_portfolio_xirr,
     ensure_directory,
     get_available_tickers,

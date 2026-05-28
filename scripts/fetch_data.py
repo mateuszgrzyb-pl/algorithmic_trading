@@ -4,9 +4,9 @@ import logging
 
 from tqdm import tqdm
 
-from app.config import settings
-from app.utils.tools import get_available_tickers, load_sp500_tickers
-from app.data_preprocessing.data_loader import (
+from src.config import settings
+from src.utils.tools import get_available_tickers, load_sp500_tickers
+from src.data_preprocessing.data_loader import (
     download_price_history,
     download_balance_sheets,
     download_income_statements

@@ -5,7 +5,7 @@ from typing import Dict
 
 import pandas as pd
 
-from app.utils.tools import get_available_tickers
+from src.utils.tools import get_available_tickers
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"

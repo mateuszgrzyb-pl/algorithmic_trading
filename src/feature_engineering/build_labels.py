@@ -2,8 +2,8 @@ import logging
 from typing import List
 import pandas as pd
 
-from app.config import settings
-from app.feature_engineering.labeling import triple_barrier_labeling_custom
+from src.config import settings
+from src.feature_engineering.labeling import triple_barrier_labeling_custom
 
 logger = logging.getLogger(__name__)
 

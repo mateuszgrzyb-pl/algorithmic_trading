@@ -3,8 +3,8 @@ import logging
 import pandas as pd
 from tqdm import tqdm
 
-from app.feature_engineering.build_labels import build_triple_barier_labels_custom
-from app.data_preprocessing.data_preprocessor import (
+from src.feature_engineering.build_labels import build_triple_barier_labels_custom
+from src.data_preprocessing.data_preprocessor import (
     deduplicate_price_data,
     remove_overlapped_observations,
     load_data,
@@ -12,12 +12,12 @@ from app.data_preprocessing.data_preprocessor import (
     save_processed_data,
     create_abt,
 )
-from app.utils.tools import (
+from src.utils.tools import (
     get_available_tickers,
     filter_sp500_companies,
     calculate_financial_ratios,
 )
-from app.config import settings
+from src.config import settings
 
 
 logging.basicConfig(

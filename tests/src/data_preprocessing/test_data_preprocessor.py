@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import pandas as pd
 from pandas.testing import assert_frame_equal
-from app.data_preprocessing.data_preprocessor import load_data, save_processed_data
+from src.data_preprocessing.data_preprocessor import load_data, save_processed_data
 
 
 @pytest.fixture
