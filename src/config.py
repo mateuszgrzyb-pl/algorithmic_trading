@@ -22,7 +22,7 @@ class LabelParams(BaseModel):
 class OverlapParams(BaseModel):
     """Parameters for removing overlapping observations."""
 
-    label_time: int = 5
+    label_time: int = 1
 
 
 class Settings(BaseSettings):
@@ -33,11 +33,11 @@ class Settings(BaseSettings):
     variables or a .env file, providing a single, type-safe source of truth.
     """
 
-    finance_toolkit_key: str
+    finance_toolkit_key: Optional[str] = None
     analysis_start_date: Optional[date] = None
     analysis_end_date: Optional[date] = None
 
-    base_path: Path = Path("data")
+    base_path: Path = Path("")
     target_label_name: str = "label_2000_100_252"
 
     label_params: LabelParams = LabelParams()

@@ -39,6 +39,7 @@ dist/
 data/abt/
 data/abt_clean/
 data/scoring/
+data/raw
 *.feather
 *.h5
 *.pkl

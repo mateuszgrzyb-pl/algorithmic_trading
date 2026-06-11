@@ -1,15 +1,18 @@
-"""
-Tools used in data preparation.
-"""
+import time
 import logging
 from pathlib import Path
 from typing import List, Set, Any, Dict, Union, Optional
 
 import numpy as np
 import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 from pyxirr import xirr
 import yfinance as yf
-
+from scipy.stats import norm, rankdata
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import ndcg_score
+from statsmodels.formula.api import ols
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -636,11 +639,17 @@ def safe_divide(numerator: float, denominator: float) -> float:
         float: Result of numerator / denominator, or np.nan if the denominator
             is zero, either argument is NaN, or an unexpected error occurs.
     """
+    if isinstance(numerator, pd.Series) or isinstance(denominator, pd.Series):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = numerator / denominator
+        if isinstance(result, pd.Series):
+            result = result.replace([np.inf, -np.inf], np.nan)
+        return result
     try:
         if denominator == 0 or pd.isna(denominator) or pd.isna(numerator):
             return np.nan
         return numerator / denominator
-    except:
+    except Exception:
         return np.nan
 
 
@@ -668,234 +677,16 @@ def get_quarter_price(ticker: str, quarter: str) -> Optional[float]:
             auto_adjust=False
         )
         
-        if hist.empty or "Close" not in hist.columns:
+        if hist.empty or "Adj Close" not in hist.columns:
             return np.nan
             
-        return hist["Close"].iloc[-1]
+        return hist["Adj Close"].iloc[-1]
     except Exception as e:
         print(f"  ⚠️  Errot. Could not download price data for ticker: {ticker}: {e}")
         return np.nan
 
 
-def get_financial_value(df: pd.DataFrame, field: str, date: str, ticker: str = "") -> float:
-    """Safely retrieve a single value from a financial DataFrame.
 
-    Looks up the given field (row) and date (column) in a financial statement
-    DataFrame. If the exact date is not found, falls back to the first available
-    column. Returns np.nan for any missing, null, or otherwise unresolvable value.
-
-    Args:
-        df (pd.DataFrame): Financial statement DataFrame with fields as the index
-            and period dates as columns (e.g. from FinanceToolkit).
-        field (str): Row label to retrieve (e.g. 'Total Revenue').
-        date (str): Column label representing the reporting period (e.g. '2023-12-31').
-        ticker (str): Stock ticker symbol, used for logging purposes. Defaults to ''.
-
-    Returns:
-        float: The retrieved value cast to float, or np.nan if the value is
-            missing, null, or an exception occurs.
-    """
-    try:
-        if df is None or df.empty:
-            return np.nan
-        
-        if field not in df.index:
-            return np.nan
-            
-        if date not in df.columns:
-            # Try to find the closest available date
-            available_dates = df.columns.tolist()
-            if not available_dates:
-                return np.nan
-            # Fall back to the first available date
-            date = available_dates[0]
-            
-        value = df.loc[field, date]
-        return float(value) if not pd.isna(value) else np.nan
-        
-    except Exception as e:
-        return np.nan
-
-
-def create_features_per_ticker(ticker: str, date: str, verbose: bool = True) -> pd.DataFrame:
-    """Compute fundamental financial features for a given ticker and quarter.
-
-    Retrieves the quarter-end closing price and financial statement data via
-    yfinance, then derives a set of valuation metrics. If the price is unavailable
-    or a critical error occurs, returns a single-row DataFrame filled with np.nan.
-
-    Args:
-        ticker (str): Stock ticker symbol (e.g. 'AAPL').
-        date (str): Reporting quarter in pandas Period format (e.g. '2024Q1').
-        verbose (bool): Whether to print warnings on non-critical failures.
-            Defaults to True.
-
-    Returns:
-        pd.DataFrame: Single-row DataFrame with the following columns:
-            - ticker: Stock ticker symbol.
-            - date: Reporting quarter.
-            - adj_price: Quarter-end closing price.
-            - graham_number_vs_price: Graham Number divided by price.
-            - eps: Basic earnings per share.
-            - price_to_sales: Price divided by revenue per share.
-            - book_value_per_share: Stockholders equity divided by shares outstanding.
-            - price_to_earnings: Price divided by EPS.
-            - market_cap: Price multiplied by shares outstanding.
-            - price_to_book: Price divided by book value per share.
-            All numeric columns are set to np.nan if data is unavailable.
-    """
-    # Default result returned on unrecoverable failure
-    default_result = pd.DataFrame({
-        'ticker': [ticker],
-        'date': [date],
-        'adj_price': [np.nan],
-        'graham_number_vs_price': [np.nan],
-        'eps': [np.nan],
-        'price_to_sales': [np.nan],
-        'book_value_per_share': [np.nan],
-        'price_to_earnings': [np.nan],
-        'market_cap': [np.nan],
-        'price_to_book': [np.nan]
-    })
-    
-    try:
-        # Fetch quarter-end closing price
-        adj_price = get_quarter_price(ticker, date)
-        if pd.isna(adj_price):
-            if verbose:
-                print(f"  ⚠️  No closing price for {ticker} w {date}")
-            return default_result
-        
-        # Derive the last calendar date of the previous quarter
-        try:
-            date_long = str((pd.Period(date) - 1).end_time.date())
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠️  Error during parsing data for {ticker}: {e}")
-            return default_result
-        
-        # Fetch quarterly financial statements
-        try:
-            ticker_obj = yf.Ticker(ticker)
-            balance_sheet = ticker_obj.quarterly_balance_sheet
-            financials = ticker_obj.quarterly_financials
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠️  Error during downloading data for {ticker}: {e}")
-            return default_result
-        
-        # Extract line items from financial statements
-        total_shareholder_equity = get_financial_value(
-            balance_sheet, "Stockholders Equity", date_long, ticker
-        )
-        weighted_average_shares = get_financial_value(
-            financials, "Basic Average Shares", date_long, ticker
-        )
-        revenue = get_financial_value(
-            financials, "Total Revenue", date_long, ticker
-        )
-        eps = get_financial_value(
-            financials, "Basic EPS", date_long, ticker
-        )
-        
-        # Derive per-share metrics
-        book_value_per_share = safe_divide(
-            total_shareholder_equity, weighted_average_shares
-        )
-        revenue_per_share = safe_divide(revenue, weighted_average_shares)
-        
-        # Graham Number: sqrt(22.5 * EPS * BVPS); undefined for non-positive products
-        try:
-            eps_bvps_product = eps * book_value_per_share
-            if pd.isna(eps_bvps_product) or eps_bvps_product <= 0:
-                graham_number = np.nan
-            else:
-                graham_number = np.sqrt(22.5 * eps_bvps_product)
-        except:
-            graham_number = np.nan
-        
-        # Compute valuation ratios
-        graham_number_vs_price = safe_divide(graham_number, adj_price)
-        price_to_sales = safe_divide(adj_price, revenue_per_share)
-        price_to_earnings = safe_divide(adj_price, eps)
-        
-        try:
-            market_cap = adj_price * weighted_average_shares
-            if pd.isna(market_cap):
-                market_cap = np.nan
-        except:
-            market_cap = np.nan
-            
-        price_to_book = safe_divide(adj_price, book_value_per_share)
-        
-        return pd.DataFrame({
-            'ticker': [ticker],
-            'date': [date],
-            'adj_price': [adj_price],
-            'graham_number_vs_price': [graham_number_vs_price],
-            'eps': [eps],
-            'price_to_sales': [price_to_sales],
-            'book_value_per_share': [book_value_per_share],
-            'price_to_earnings': [price_to_earnings],
-            'market_cap': [market_cap],
-            'price_to_book': [price_to_book]
-        })
-        
-    except Exception as e:
-        if verbose:
-            print(f"  ❌ Unexpected error for {ticker} on {date}: {e}")
-        return default_result
-
-
-def process_multiple_tickers(tickers: list, date: str, verbose: bool = True) -> pd.DataFrame:
-    """Process a list of tickers and concatenate their feature DataFrames.
-
-    Iterates over the provided tickers, calls create_features_per_ticker for
-    each, and collects the results. If a ticker raises an unexpected exception,
-    a fallback row filled with np.nan is appended so that no ticker is silently
-    dropped from the output.
-
-    Args:
-        tickers (list): List of stock ticker symbols (e.g. ['AAPL', 'MSFT']).
-        date (str): Reporting quarter in pandas Period format (e.g. '2024Q1').
-        verbose (bool): Whether to print progress and error messages.
-            Defaults to True.
-
-    Returns:
-        pd.DataFrame: Concatenated DataFrame of all per-ticker feature rows,
-            with a reset index. Returns an empty DataFrame if the input list
-            is empty or all calls fail before appending any results.
-    """
-    results = []
-    
-    for i, ticker in enumerate(tickers, 1):
-        if verbose:
-            print(f"[{i}/{len(tickers)}] Processing {ticker}...")
-        
-        try:
-            df = create_features_per_ticker(ticker, date, verbose=verbose)
-            results.append(df)
-        except Exception as e:
-            # Append a blank row so the ticker is still represented in the output
-            if verbose:
-                print(f"  ❌ Critical error for {ticker}: {e}")
-            results.append(pd.DataFrame({
-                'ticker': [ticker],
-                'date': [date],
-                'adj_price': [np.nan],
-                'graham_number_vs_price': [np.nan],
-                'eps': [np.nan],
-                'price_to_sales': [np.nan],
-                'book_value_per_share': [np.nan],
-                'price_to_earnings': [np.nan],
-                'market_cap': [np.nan],
-                'price_to_book': [np.nan]
-            }))
-    
-    if not results:
-        return pd.DataFrame()
-    
-    return pd.concat(results, ignore_index=True)
 
 
 def get_top_interactions(shap_interaction_values: np.ndarray, X: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
@@ -938,9 +729,755 @@ def get_top_interactions(shap_interaction_values: np.ndarray, X: pd.DataFrame, t
                 'Feature_B': feature_names[j],
                 'Interaction_Strength': val * 2 
             })
-
     # 3. Tworzymy DataFrame i sortujemy
     df_interactions = pd.DataFrame(interactions)
     df_interactions = df_interactions.sort_values(by='Interaction_Strength', ascending=False)
     
     return df_interactions.head(top_n)
+
+
+class CrossSectionalStationarityTransformer(BaseEstimator, TransformerMixin):
+    """Transformer for removing non-stationarity and inflationary trends in financial data.
+
+    Applies transformations cross-sectionally per quarter (or point in time).
+    Preserves relative distances and proportions between entities within the same period,
+    enabling tree-based models (e.g., Random Forest) to capture non-linear relationships
+    such as U-shaped patterns.
+    """
+
+    def __init__(
+        self, features_to_scale: List[str], log_features: Optional[List[str]] = None
+    ) -> None:
+        """Initialize the transformer with specific feature groups.
+
+        Args:
+            features_to_scale (List[str]): Column names to undergo cross-sectional Robust Scaling.
+            log_features (Optional[List[str]]): Column names to undergo Symmetric Log transformation first.
+        """
+        self.features_to_scale = features_to_scale
+        self.log_features = log_features if log_features else []
+
+    def fit(
+        self, X: pd.DataFrame, y: Optional[pd.Series] = None
+    ) -> "CrossSectionalStationarityTransformer":
+        """Fit the transformer.
+
+        This transformer is cross-sectionally stateless across time. Assets within
+        period T are evaluated solely against their peers within period T. Thus,
+        fit only returns self.
+
+        Args:
+            X (pd.DataFrame): Input features dataframe.
+            y (Optional[pd.Series]): Target values (ignored).
+
+        Returns:
+            CrossSectionalStationarityTransformer: The fitted transformer instance.
+        """
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform features cross-sectionally to enforce stationarity.
+
+        Applies a symmetric log transformation to highly skewed volumetric features,
+        followed by a vectorized, group-wise Robust Scaling per quarter. Missing 
+        values (NaNs) are natively propagated.
+
+        Args:
+            X (pd.DataFrame): Dataframe containing features and a 'date' column.
+
+        Returns:
+            pd.DataFrame: Transformed dataframe with normalized, stationary features.
+        """
+        df_out = X.copy()
+
+        # 1. Symmetric Log transformation: sign(x) * log(1 + |x|)
+        # Handles zeros and negative values safely without global shifts or data leakage.
+        for col in self.log_features:
+            df_out[col] = np.sign(df_out[col]) * np.log1p(np.abs(df_out[col]))
+
+        # 2. Vectorized helper for localized Robust Scaling per quarter
+        def fast_robust_scale(x: pd.Series) -> pd.Series:
+            """Apply robust scaling on a single cross-sectional slice.
+
+            Args:
+                x (pd.Series): Feature values for a single date group.
+
+            Returns:
+                pd.Series: Scaled feature slice where NaNs are preserved.
+            """
+            clean_x = x.dropna()
+            if len(clean_x) == 0:
+                return x
+
+            q75, q25 = np.percentile(clean_x, [75, 25])
+            iqr = q75 - q25
+            median = np.median(clean_x)
+
+            # Fallback to mean de-meaning if the feature has no variance in the quarter
+            if iqr == 0:
+                return x - median
+
+            # Arithmetic operations on the full Series automatically propagate NaNs
+            return (x - median) / iqr
+
+        # 3. Apply transformation group-wise to isolate quarters completely
+        for col in self.features_to_scale:
+            df_out[col] = df_out.groupby("date", group_keys=False)[col].transform(
+                fast_robust_scale
+            )
+        return df_out
+
+
+def calculate_cross_sectional_spearman(
+    df: pd.DataFrame,
+    target: str,
+    pred: str,
+    date_col: str = "date",
+) -> float:
+    """
+    Calculate the mean cross-sectional Spearman correlation using optimized ranking.
+
+    This function computes the cross-sectional correlation by first filtering out 
+    periods that have 5 or fewer valid (non-NaN) target-prediction pairs. It then 
+    simultaneously ranks the valid pairs in a vectorized manner (Cython) and 
+    calculates the Pearson correlation on those ranks to avoid the high overhead 
+    of pandas non-Pearson groupby correlations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame containing the date, target, and prediction columns.
+    target : str
+        The column name of the target variable.
+    pred : str
+        The column name of the predicted variable.
+    date_col : str, default "date"
+        The column name used to group the data.
+
+    Returns
+    -------
+    float
+        The average cross-sectional Spearman correlation, or np.nan if no
+        valid periods exist.
+
+    Raises
+    ------
+    KeyError
+        If any of the specified columns (date_col, target, pred) are missing
+        from the DataFrame.
+    """
+    for col in (date_col, target, pred):
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found in the DataFrame.")
+
+    # Filtrowanie po liczbie valid pairs, aby uniknąć fałszywych korelacji dla grup z brakami
+    valid_pairs = df[[date_col, target, pred]].dropna().groupby(date_col).size()
+    valid_dates = valid_pairs[valid_pairs > 5].index
+
+    if valid_dates.empty:
+        return np.nan
+
+    filtered = df.loc[df[date_col].isin(valid_dates), [date_col, target, pred]].copy()
+
+    # Jednoczesne, wektorowe rangowanie obu kolumn w jednym wywołaniu groupby
+    filtered[[target, pred]] = filtered.groupby(date_col)[[target, pred]].rank(method="average")
+
+    # Obliczenie korelacji Pearsona na zrangowanych danych
+    correlations = (
+        filtered.groupby(date_col)[[target, pred]]
+        .corr(method="pearson")
+        .xs(target, level=1)[pred]
+    )
+
+    mean_corr = correlations.mean()
+    return np.nan if pd.isna(mean_corr) else float(mean_corr)
+
+
+def rank_gauss_transform(series: pd.Series) -> pd.Series:
+    """
+    Apply Rank Gauss transformation to a pandas Series using NumPy and SciPy.
+
+    This method transforms the numerical values of a Series to a standard normal
+    distribution. It converts the input to a float NumPy array to prevent dtype 
+    coercion bugs (e.g., with integer Series), computes ranks using SciPy, and 
+    applies the inverse cumulative distribution function (PPF).
+
+    Parameters
+    ----------
+    series : pd.Series
+        The input pandas Series to transform.
+
+    Returns
+    -------
+    pd.Series
+        The transformed Series with values following a standard normal distribution.
+        Missing values (NaN), original indices, and names are preserved.
+    """
+    valid_mask = series.notna().values
+    valid_count = int(valid_mask.sum())
+
+    if valid_count < 10:
+        return series.copy()
+
+    arr = series.to_numpy(dtype=float, na_value=np.nan, copy=True)
+
+    ranks = rankdata(arr[valid_mask], method="average")
+    uniform = (ranks - 0.5) / valid_count
+    arr[valid_mask] = norm.ppf(uniform)
+
+    return pd.Series(arr, index=series.index, name=series.name)
+
+
+def add_quarterly_vix(
+    df: pd.DataFrame,
+    date_col: str = "date",
+    vix_col: str = "vix",
+) -> pd.DataFrame:
+    """
+    Download VIX and attach last-of-quarter closing price to a quarterly DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with a quarterly column (either strings like '2023Q1' or pd.Period).
+    date_col : str, default "date"
+        Column name containing the quarterly Period values.
+    vix_col : str, default "vix"
+        Name for the new VIX column in the output.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input DataFrame extended with `vix_col`. A left join is used so missing
+        quarters produce NaN rather than silently dropping rows.
+    """
+    if date_col not in df.columns:
+        raise KeyError(f"Column '{date_col}' not found in the DataFrame.")
+
+    out_df = df.copy()
+
+    # Upewnienie się, że mamy typ Period, co zapobiega błędom przy merge
+    if not pd.api.types.is_period_dtype(out_df[date_col]):
+        out_df[date_col] = pd.PeriodIndex(out_df[date_col], freq="Q")
+
+    periods = out_df[date_col]
+    start = periods.min().start_time.strftime("%Y-%m-%d")
+    
+    # max() + 1 tworzy bufor. Gwarantuje obejście "exclusive end date" w yfinance 
+    # i pobranie faktycznie ostatniego dnia kwartału
+    end = (periods.max() + 1).end_time.strftime("%Y-%m-%d")
+
+    raw = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=False)
+
+    if raw.empty or "Close" not in raw:
+        out_df[vix_col] = float("nan")
+        return out_df
+
+    vix_close = raw["Close"]
+    
+    # Bezpieczniejsza alternatywa dla .squeeze(). Eliminuje ryzyko zredukowania 
+    # DataFrame'u 1x1 do pojedynczego float'a (skalara).
+    if isinstance(vix_close, pd.DataFrame):
+        vix_close = vix_close.iloc[:, 0]
+
+    vix_q = (
+        vix_close
+        .resample("QE")         
+        .last()
+        .to_period("Q")
+        .rename(vix_col)
+    )
+
+    return out_df.merge(vix_q, left_on=date_col, right_index=True, how="left")
+
+
+def calculate_cross_sectional_ndcg(
+    df: pd.DataFrame,
+    target: str,
+    pred: str,
+    date_col: str = "date",
+    k: int = 10,
+    n_random: int = 50,
+    random_state: int = 42,
+) -> tuple[float, float]:
+    """
+    Calculate the cross-sectional Normalized Discounted Cumulative Gain (nDCG).
+
+    This function computes the mean nDCG@k for a given model's predictions and 
+    compares it against a baseline of random predictions. Data is grouped by 
+    a date column. Targets are converted to ranks to serve as strictly non-negative 
+    relevance scores (required by scikit-learn).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame containing the date, target, and prediction columns.
+    target : str
+        The column name of the target variable (ground truth).
+    pred : str
+        The column name of the predicted variable.
+    date_col : str, default 'date'
+        The column name used to group the data cross-sectionally.
+    k : int, default 10
+        The number of top predictions to consider for the nDCG metric.
+    n_random : int, default 50
+        The number of random baseline evaluations per group.
+    random_state : int, default 42
+        Seed for the random number generator to ensure reproducibility.
+
+    Returns
+    -------
+    tuple of (float, float)
+        A tuple containing the mean model nDCG score and the mean random 
+        baseline nDCG score. Returns (np.nan, np.nan) if no valid periods exist.
+    """
+    for col in (date_col, target, pred):
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found in the DataFrame.")
+
+    model_scores, random_scores = [], []
+    rng = np.random.default_rng(random_state)
+
+    for _, group in df.groupby(date_col):
+        valid_group = group[[target, pred]].dropna()
+        n_items = len(valid_group)
+
+        # nDCG wymaga przynajmniej 2 elementów, aby jakkolwiek oceniać ranking
+        if n_items > 1:
+            # sklearn's ndcg_score wymaga nieujemnych relevance scores.
+            # Użycie ranks/pct rozwiązuje ten problem. Higher values = higher relevance.
+            true_ranks = valid_group[target].rank(method="average").values.reshape(1, -1)
+            pred_vals = valid_group[pred].values.reshape(1, -1)
+            
+            model_scores.append(ndcg_score(true_ranks, pred_vals, k=k))
+
+            # np.broadcast_to tworzy "wirtualną" macierz powieloną wierszami (bez alokacji nowej pamięci)
+            true_ranks_broadcast = np.broadcast_to(true_ranks, (n_random, n_items))
+            
+            # Generowanie macierzy losowych floatów
+            random_preds = rng.random((n_random, n_items))
+            
+            # ndcg_score oblicza nDCG wiersz po wierszu i sam zwraca uśrednioną wartość
+            avg_random_ndcg = ndcg_score(true_ranks_broadcast, random_preds, k=k)
+            random_scores.append(avg_random_ndcg)
+
+    if not model_scores:
+        return np.nan, np.nan
+
+    return float(np.mean(model_scores)), float(np.mean(random_scores))
+
+
+def check_for_signal(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    num_of_samples: int = 1000,
+    clip_x_outliers: bool = False,
+    clip_y_outliers: bool = False,
+) -> None:
+    """
+    Evaluate and plot the linear relationship between a signal and a target.
+
+    This function cleans the data (removes NaNs), optionally clips extreme values 
+    assuming Z-scored data (keeps values between -3 and 3), samples the dataset 
+    for plotting performance, and fits an OLS model without an intercept. 
+    It displays a scatter plot with a regression line, along with slope and p-value.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame containing the feature and target columns.
+    x : str
+        The column name of the independent variable (signal/feature).
+    y : str
+        The column name of the dependent variable (target).
+    num_of_samples : int, default 1000
+        Maximum number of data points to sample for the plot. If the dataset 
+        has fewer valid rows, all available valid rows are used.
+    clip_x_outliers : bool, default False
+        If True, filters out `x` values outside the [-3, 3] range.
+    clip_y_outliers : bool, default False
+        If True, filters out `y` values outside the [-3, 3] range.
+
+    Returns
+    -------
+    None
+        Displays a seaborn scatter plot with an OLS regression line.
+    """
+    # Sprawdzenie, czy kolumny istnieją
+    for col in (x, y):
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found in the DataFrame.")
+
+    # 1. Wycięcie tylko niezbędnych kolumn i od razu usunięcie NaN
+    df_clean = df[[x, y]].dropna()
+
+    # 2. Usuwanie outlierów
+    if clip_x_outliers:
+        shape_before = df_clean.shape[0]
+        df_clean = df_clean[df_clean[x].between(-3, 3)]
+        removed_fraction = 100 * (shape_before - df_clean.shape[0]) / shape_before
+        print(f"Usunąłem {removed_fraction:.2f}% zbioru dla X.")
+
+    if clip_y_outliers:
+        shape_before = df_clean.shape[0]
+        df_clean = df_clean[df_clean[y].between(-3, 3)]
+        removed_fraction = 100 * (shape_before - df_clean.shape[0]) / shape_before
+        print(f"Usunąłem {removed_fraction:.2f}% zbioru dla Y.")
+
+    n_available = len(df_clean)
+    if n_available == 0:
+        print("Brak danych do narysowania wykresu po usunięciu NaN i outlierów.")
+        return
+
+    # 3. Bezpieczne próbkownie (zabezpiecza przed ValueError gdy num_of_samples > n_available)
+    sample_size = min(num_of_samples, n_available)
+    df_sample = df_clean.sample(n=sample_size, random_state=42)
+
+    # 4. Modelowanie OLS (bez wyrazu wolnego: ~ -1)
+    # Uwaga: formula API może zawieść, jeśli nazwy kolumn zawierają spacje lub znaki specjalne.
+    model = ols(data=df_sample, formula=f"{y} ~ -1 + {x}").fit()
+
+    # 5. Rysowanie wykresu
+    g = sns.lmplot(
+        x=x,
+        y=y,
+        data=df_sample,
+        scatter_kws={"alpha": 0.3},
+        line_kws={"color": "red"},
+    )
+
+    # Bezpieczne pobranie osi bezpośrednio z obiektu seaborn
+    ax = g.ax
+
+    # 6. Dodanie tekstu na wykresie
+    ax.text(
+        0.05,
+        0.95,
+        f"Nachylenie: {model.params.iloc[0]:.4f}\nP-value: {model.pvalues.iloc[0]:.4f}",
+        transform=ax.transAxes,
+        fontsize=12,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    plt.show()
+    
+#%% live prediction
+# Maksymalny dopuszczalny "wiek" najnowszego raportu wzgledem konca kwartalu T-1.    
+MAX_STALENESS_DAYS = 200
+TTM_QUARTERS = 4
+# Walidacja ciaglosci kwartalow (kwartaly fiskalne maja 13-14 tygodni)
+MIN_QUARTER_GAP_DAYS = 70
+MAX_QUARTER_GAP_DAYS = 120
+
+
+def parse_quarter(quarter: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Parse a quarter string to obtain the normalized boundary dates for T and T-1 quarters.
+    
+    Parameters
+    ----------
+    quarter : str
+        The quarter representation (e.g., '2026Q1', '2025Q4').
+    
+    Returns
+    -------
+    tuple of (pd.Timestamp, pd.Timestamp)
+        A tuple containing:
+        - The normalized end date of the target quarter T (at 00:00:00).
+        - The normalized end date of the preceding quarter T-1 (at 00:00:00).
+    """
+    period = pd.Period(quarter, freq="Q-DEC")
+    t_end = period.end_time.normalize()
+    t_minus_1_end = (period - 1).end_time.normalize()
+    return t_end, t_minus_1_end
+ 
+ 
+def _strip_tz(idx) -> pd.DatetimeIndex:
+    idx = pd.DatetimeIndex(idx)
+    return idx.tz_localize(None) if idx.tz is not None else idx
+ 
+ 
+def pick_ttm_columns(columns, cutoff: pd.Timestamp,
+                     n: int = TTM_QUARTERS) -> pd.DatetimeIndex | None:
+    """
+    Select the contiguous TTM quarters ending on or before the cutoff date.
+    
+    Parameters
+    ----------
+    columns : array-like
+        The list of available dates (columns) from the financial statement.
+    cutoff : pd.Timestamp
+        The latest acceptable date for the quarters (point-in-time boundary).
+    n : int, default TTM_QUARTERS
+        The number of consecutive quarters required to build a TTM window.
+    
+    Returns
+    -------
+    pd.DatetimeIndex or None
+        The selected chronological list of n quarter dates (ascending), 
+        or `None` if the dates are insufficient or do not form a consistent 
+        consecutive window.
+    """
+    cols = _strip_tz(pd.Index(columns)).sort_values()
+    eligible = cols[cols <= cutoff]
+    if len(eligible) < n:
+        return None
+    sel = eligible[-n:]
+    gaps = np.diff(sel.values).astype("timedelta64[D]").astype(int)
+    if any(g < MIN_QUARTER_GAP_DAYS or g > MAX_QUARTER_GAP_DAYS for g in gaps):
+        logger.warning("Niespojne okno TTM (odstepy w dniach: %s) dla dat %s",
+                       list(gaps), [str(d.date()) for d in sel])
+        return None
+    return sel
+ 
+ 
+def _get_line_item(stmt: pd.DataFrame, col: pd.Timestamp, names: list[str]):
+    """
+    Sum a specific financial statement item over a TTM (trailing twelve months) window.
+    
+    Parameters
+    ----------
+    stmt : pd.DataFrame
+        The financial statement (e.g., income statement) from yfinance.
+    cols : pd.DatetimeIndex
+        The quarterly column timestamps representing the TTM window.
+    names : list of str
+        Possible candidate names for the line item in the statement.
+    ticker : str
+        The stock ticker symbol, used for logging purposes.
+    label : str
+        A user-friendly label of the metric being fetched (e.g., 'revenue').
+    
+    Returns
+    -------
+    float
+        The TTM sum of the specified item, or `np.nan` if any quarter is missing 
+        or invalid, or if `cols` is empty.
+    """
+    if stmt is None or stmt.empty:
+        return np.nan
+    col_map = {pd.Timestamp(c).tz_localize(None) if pd.Timestamp(c).tz else pd.Timestamp(c): c
+               for c in stmt.columns}
+    real_col = col_map.get(col)
+    if real_col is None:
+        return np.nan
+    for name in names:
+        if name in stmt.index:
+            val = stmt.loc[name, real_col]
+            if pd.notna(val):
+                return float(val)
+    return np.nan
+ 
+ 
+def _ttm_sum(stmt: pd.DataFrame, cols: pd.DatetimeIndex, names: list[str], ticker: str, label: str):
+    """
+    Calculate the Trailing Twelve Months (TTM) sum for a specific financial line item.
+    
+    Parameters
+    ----------
+    stmt : pd.DataFrame
+        Financial statement (income or balance sheet) where rows are line items 
+        and columns are report dates.
+    cols : pd.DatetimeIndex
+        The specific dates (usually 4 quarters) to be summed.
+    names : list of str
+        Potential labels/keys for the line item in the DataFrame (to handle variations).
+    ticker : str
+        Stock ticker symbol for logging purposes.
+    label : str
+        Human-readable name of the line item (e.g., 'revenue') for logging.
+    
+    Returns
+    -------
+    float
+        The TTM sum of the requested item. Returns `np.nan` if any period is 
+        missing or non-finite.
+    """
+    vals = [_get_line_item(stmt, c, names) for c in cols]
+    if any(not np.isfinite(v) for v in vals):
+        missing = [str(c.date()) for c, v in zip(cols, vals) if not np.isfinite(v)]
+        logger.warning("%s: brak '%s' dla kwartalow %s - TTM = NaN", ticker, label, missing)
+        return np.nan
+    return float(np.sum(vals))
+ 
+
+def get_price_asof(tk: yf.Ticker, asof: pd.Timestamp) -> tuple[float, pd.Timestamp | None]:
+    """
+    Retrieve the adjusted close price on or prior to a given date.
+    
+    Parameters
+    ----------
+    tk : yf.Ticker
+        The yfinance Ticker object for the target equity.
+    asof : pd.Timestamp
+        The target reference date.
+    
+    Returns
+    -------
+    tuple of (float, pd.Timestamp or None)
+        A tuple containing:
+        - The adjusted close price (float), or `np.nan` if no data is found.
+        - The actual trading date associated with the price (pd.Timestamp), 
+          or `None` if no data is found.
+    """
+    hist = tk.history(
+        start=(asof - pd.Timedelta(days=14)).strftime("%Y-%m-%d"),
+        end=(asof + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        auto_adjust=True,
+    )
+    if hist is None or hist.empty:
+        return np.nan, None
+    hist.index = _strip_tz(hist.index)
+    hist = hist[hist.index <= asof]
+    if hist.empty:
+        return np.nan, None
+    return float(hist["Close"].iloc[-1]), hist.index[-1]
+ 
+ 
+def fetch_ticker_features(ticker: str, quarter: str) -> dict:
+    """
+    Extract and calculate financial features for a single stock ticker.
+    
+    Parameters
+    ----------
+    ticker : str
+        The stock ticker symbol (e.g., 'AAPL').
+    quarter : str
+        The target quarter representation (e.g., '2026Q1').
+    
+    Returns
+    -------
+    dict
+        A dictionary containing the parsed fundamentals, period metadata, 
+        and calculated financial ratios (e.g., P/S, ROE).
+    """
+    t_end, t_minus_1_end = parse_quarter(quarter)
+    tk = yf.Ticker(ticker)
+ 
+    row = {
+        "ticker": ticker,
+        "quarter": quarter,
+        "price_date": None,
+        "adj_close": np.nan,
+        "fundamentals_period_end": None,
+        "ttm_window": None,
+        "revenue_ttm": np.nan,
+        "net_income_ttm": np.nan,
+        "weighted_average_shares": np.nan,
+        "total_shareholder_equity": np.nan,
+        "revenue_per_share": np.nan,
+        "price_to_sales": np.nan,
+        "roe": np.nan,
+    }
+
+    try:
+        adj_close, price_date = get_price_asof(tk, t_end)
+        row["adj_close"] = adj_close
+        row["price_date"] = price_date
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s: blad pobierania ceny: %s", ticker, exc)
+ 
+    try:
+        inc = tk.quarterly_income_stmt
+        bs = tk.quarterly_balance_sheet
+ 
+        ttm_cols = (pick_ttm_columns(inc.columns, t_minus_1_end)
+                    if inc is not None and not inc.empty else None)
+        bs_col_idx = (_strip_tz(pd.Index(bs.columns)).sort_values()
+                      if bs is not None and not bs.empty else pd.DatetimeIndex([]))
+
+        bs_cutoff = ttm_cols[-1] if ttm_cols is not None else t_minus_1_end
+        bs_eligible = bs_col_idx[bs_col_idx <= bs_cutoff]
+        bs_col = bs_eligible.max() if len(bs_eligible) else None
+ 
+        if ttm_cols is None and bs_col is None:
+            logger.warning("%s: brak wystarczajacych sprawozdan <= %s",
+                           ticker, t_minus_1_end.date())
+            return row
+
+        newest_inc = ttm_cols[-1] if ttm_cols is not None else None
+        for label, col in (("income", newest_inc), ("balance", bs_col)):
+            if col is not None and (t_minus_1_end - col).days > MAX_STALENESS_DAYS:
+                logger.warning(
+                    "%s: raport %s z %s jest starszy niz %d dni wzgledem %s - pomijam",
+                    ticker, label, col.date(), MAX_STALENESS_DAYS, t_minus_1_end.date(),
+                )
+                if label == "income":
+                    ttm_cols = None
+                    newest_inc = None
+                else:
+                    bs_col = None
+ 
+        if ttm_cols is not None:
+            row["fundamentals_period_end"] = newest_inc
+            row["ttm_window"] = [str(c.date()) for c in ttm_cols]
+
+            row["revenue_ttm"] = _ttm_sum(
+                inc, ttm_cols, ["Total Revenue", "Operating Revenue"], ticker, "revenue")
+            row["net_income_ttm"] = _ttm_sum(
+                inc, ttm_cols, ["Net Income", "Net Income Common Stockholders"], ticker, "net_income")
+
+            for c in reversed(list(ttm_cols)):
+                sh = _get_line_item(inc, c, ["Basic Average Shares", "Diluted Average Shares"])
+                if np.isfinite(sh):
+                    if c != newest_inc:
+                        logger.warning("%s: brak shares w %s - uzywam %s",
+                                       ticker, newest_inc.date(), c.date())
+                    row["weighted_average_shares"] = sh
+                    break
+ 
+        if bs_col is not None:
+            if row["fundamentals_period_end"] is None:
+                row["fundamentals_period_end"] = bs_col
+            row["total_shareholder_equity"] = _get_line_item(
+                bs, bs_col, ["Stockholders Equity", "Common Stock Equity"])
+            if newest_inc is not None and newest_inc != bs_col:
+                logger.warning("%s: rozne okresy: income=%s, balance=%s",
+                               ticker, newest_inc.date(), bs_col.date())
+    except Exception as exc:
+        logger.warning("%s: blad pobierania fundamentow: %s", ticker, exc)
+        return row
+ 
+    row["revenue_per_share"] = safe_divide(row["revenue_ttm"], row["weighted_average_shares"])
+    row["price_to_sales"] = safe_divide(row["adj_close"], row["revenue_per_share"])
+    row["roe"] = safe_divide(row["net_income_ttm"], row["total_shareholder_equity"])
+    return row
+ 
+ 
+def fetch_live_features(quarter: str, tickers: list[str], pause_s: float = 0.5, verbose=False) -> pd.DataFrame:
+    """
+    Fetch and aggregate live features for a list of tickers in a given quarter.
+    
+    Parameters
+    ----------
+    quarter : str
+        The target quarter for which features are retrieved (e.g., '2026Q1').
+    tickers : list of str
+        List of stock ticker symbols to process.
+    pause_s : float, default 0.5
+        Time in seconds to pause between API requests to mitigate rate limiting.
+    verbose : bool, default False
+        If True, prints progress updates to the standard output.
+    
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame containing the fetched features, indexed by ticker.
+    
+    Raises
+    ------
+    KeyError
+        If the underlying feature-fetching function does not return a 'ticker' key,
+        or if the input ticker list is empty.
+    """
+    rows = []
+    for i, ticker in enumerate(tickers):
+        if verbose:
+            print(f"[{i+1}/{len(tickers)}] Processing {ticker}...")
+        rows.append(fetch_ticker_features(ticker, quarter))
+        if pause_s and i < len(tickers) - 1:
+            time.sleep(pause_s)  # zmniejsza ryzyko throttlingu Yahoo
+    return pd.DataFrame(rows).set_index("ticker")
+ 

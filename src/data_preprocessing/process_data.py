@@ -63,7 +63,7 @@ def run_price_preprocessing() -> None:
     # Stage 3: Remove overlaps to ensure target independence
     label_time = settings.overlap_params.label_time
     for idx, ticker in enumerate(tqdm(tickers, desc="Stage 3: Removing overlaps")):
-        offset = idx % label_time
+        offset = 0  # idx % label_time
         remove_overlapped_observations(
             ticker, offset, label_time, input_dir=stage3_dir, output_dir=stage4_dir
         )
@@ -122,9 +122,9 @@ def main():
     logging.info("=== STARTING DATA PROCESSING PIPELINE ===")
     logging.info("=========================================")
     try:
-        run_label_building()
-        run_price_preprocessing()
-        run_data_merge_and_save()
+        #run_label_building()
+        #run_price_preprocessing()
+        #run_data_merge_and_save()
         run_abt_creation_and_cleaning()
         logging.info("===========================================")
         logging.info("=== PIPELINE COMPLETED SUCCESSFULLY! ===")
